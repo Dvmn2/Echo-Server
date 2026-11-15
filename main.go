@@ -35,6 +35,8 @@ type info struct {
 	Author   string
 }
 
+var data info
+
 func getHostname() string {
 	hostname, err := os.Hostname()
 	if err != nil {
@@ -79,16 +81,18 @@ func getAuthor() string {
 	return author
 }
 
+func loadData() {
+	hostname := getHostname()
+	ips := strings.Join(getIpsV4(), ", ")
+	author := getAuthor()
+	data = info{Hostname: hostname, IP: ips, Author: author}
+}
+
 func handler(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/" {
 		http.NotFound(w, r)
 		return
 	}
-
-	hostname := getHostname()
-	ips := strings.Join(getIpsV4(), ", ")
-	author := getAuthor()
-	data := info{Hostname: hostname, IP: ips, Author: author}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := page.Execute(w, data); err != nil {
@@ -97,6 +101,7 @@ func handler(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
+	loadData()
 	http.HandleFunc("/", handler)
 	log.Fatal(http.ListenAndServe(listenAddr, nil))
 }
