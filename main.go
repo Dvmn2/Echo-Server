@@ -1,13 +1,39 @@
 package main
 
 import (
+	"html/template"
 	"log"
 	"net"
 	"net/http"
 	"os"
+	"strings"
 )
 
 const listenAddr = ":8000"
+
+var page = template.Must(template.New("page").Parse(`
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <title>Информация о хосте</title>
+</head>
+<body>
+  <h1>Информация о хосте</h1>
+  <table>
+    <tr><td>Имя хоста:</td><td>{{.Hostname}}</td></tr>
+    <tr><td>IP-адрес:</td><td>{{.IP}}</td></tr>
+    <tr><td>Автор:</td><td>{{.Author}}</td></tr>
+  </table>
+</body>
+</html>
+`))
+
+type info struct {
+	Hostname string
+	IP       string
+	Author   string
+}
 
 func getHostname() string {
 	hostname, err := os.Hostname()
@@ -54,23 +80,23 @@ func getAuthor() string {
 }
 
 func handler(w http.ResponseWriter, r *http.Request) {
-	http.NotFound(w, r)
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
+
+	hostname := getHostname()
+	ips := strings.Join(getIpsV4(), ", ")
+	author := getAuthor()
+	data := info{Hostname: hostname, IP: ips, Author: author}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if err := page.Execute(w, data); err != nil {
+		log.Printf("[ERROR] Render error: %v", err)
+	}
 }
 
 func main() {
-	hostname := getHostname()
-	ips := getIpsV4()
-	author := getAuthor()
-
-	log.Println("TEST:\n")
-	log.Println(hostname)
-
-	for _, ip := range ips {
-		log.Println(ip)
-	}
-
-	log.Println(author)
-
 	http.HandleFunc("/", handler)
 	log.Fatal(http.ListenAndServe(listenAddr, nil))
 }
