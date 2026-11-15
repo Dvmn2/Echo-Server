@@ -3,8 +3,11 @@ package main
 import (
 	"log"
 	"net"
+	"net/http"
 	"os"
 )
+
+const listenAddr = ":8000"
 
 func getHostname() string {
 	hostname, err := os.Hostname()
@@ -50,6 +53,10 @@ func getAuthor() string {
 	return author
 }
 
+func handler(w http.ResponseWriter, r *http.Request) {
+	http.NotFound(w, r)
+}
+
 func main() {
 	hostname := getHostname()
 	ips := getIpsV4()
@@ -63,4 +70,7 @@ func main() {
 	}
 
 	log.Println(author)
+
+	http.HandleFunc("/", handler)
+	log.Fatal(http.ListenAndServe(listenAddr, nil))
 }
