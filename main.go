@@ -40,7 +40,7 @@ var data info
 func getHostname() string {
 	hostname, err := os.Hostname()
 	if err != nil {
-		log.Println("[ERROR] Host name identify error")
+		log.Printf("[ERROR] Host name identify error: %v", err)
 		return ""
 	}
 	return hostname
@@ -49,7 +49,7 @@ func getHostname() string {
 func getAddreses() []net.Addr {
 	addresses, err := net.InterfaceAddrs()
 	if err != nil {
-		log.Println("[ERROR] Addresses identify error")
+		log.Printf("[ERROR] Addresses identify error: %v", err)
 		return []net.Addr{}
 	}
 	return addresses
@@ -66,7 +66,7 @@ func getIpsV4() []string {
 		}
 	}
 	if ips == nil {
-		log.Println("[ERROR] There are no IPv4 addresses")
+		log.Println("[WARNING] There are no IPv4 addresses")
 		return []string{}
 	}
 	return ips
