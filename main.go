@@ -16,13 +16,29 @@ func getHostname() string {
 }
 
 func getAddreses() []net.Addr {
-
 	addresses, err := net.InterfaceAddrs()
 	if err != nil {
 		log.Println("[ERROR] Addresses identify error")
 		return []net.Addr{}
 	}
 	return addresses
+}
+
+func getIpsV4() []string {
+	addresses := getAddreses()
+	var ips []string
+	for _, adress := range addresses {
+		if ipNet, ok := adress.(*net.IPNet); ok && !ipNet.IP.IsLoopback() {
+			if ipV4 := ipNet.IP.To4(); ipV4 != nil {
+				ips = append(ips, ipV4.String())
+			}
+		}
+	}
+	if ips == nil {
+		log.Println("[ERROR] There are no IPv4 addresses")
+		return []string{}
+	}
+	return ips
 }
 
 func getAuthor() string {
@@ -36,14 +52,14 @@ func getAuthor() string {
 
 func main() {
 	hostname := getHostname()
-	addresses := getAddreses()
+	ips := getIpsV4()
 	author := getAuthor()
 
 	log.Println("TEST:\n")
 	log.Println(hostname)
 
-	for _, address := range addresses {
-		log.Println(address)
+	for _, ip := range ips {
+		log.Println(ip)
 	}
 
 	log.Println(author)
