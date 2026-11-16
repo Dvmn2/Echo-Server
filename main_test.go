@@ -6,16 +6,60 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
-// withData подменяет глобальную переменную data на время теста.
-func withData(t *testing.T, d info) {
+// ---------- вспомогательные функции для работы с кэшем ----------
+
+// setCache подменяет кэш (data и lastRefresh) под мьютексом
+// и восстанавливает прежнее состояние после теста.
+func setCache(t *testing.T, d info, fetchedAt time.Time) {
 	t.Helper()
-	old := data
-	data = d
-	t.Cleanup(func() { data = old })
+
+	mu.Lock()
+	oldData, oldTime := data, lastRefresh
+	data, lastRefresh = d, fetchedAt
+	mu.Unlock()
+
+	t.Cleanup(func() {
+		mu.Lock()
+		data, lastRefresh = oldData, oldTime
+		mu.Unlock()
+	})
 }
+
+// withFreshCache кладёт в кэш d как только что полученные данные:
+// getData() вернёт их без пересбора.
+func withFreshCache(t *testing.T, d info) {
+	t.Helper()
+	setCache(t, d, time.Now())
+}
+
+// withEmptyCache делает кэш «никогда не заполнявшимся»:
+// следующий getData() обязан собрать данные заново.
+func withEmptyCache(t *testing.T) {
+	t.Helper()
+	setCache(t, info{}, time.Time{})
+}
+
+// expireCache искусственно «старит» кэш, чтобы следующий getData() обновил его.
+func expireCache() {
+	mu.Lock()
+	lastRefresh = time.Now().Add(-refreshTTL - time.Second)
+	mu.Unlock()
+}
+
+func get(t *testing.T, path string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, path, nil)
+	rec := httptest.NewRecorder()
+	handler(rec, req)
+	return rec
+}
+
+// ---------- сбор отдельных значений ----------
 
 func TestGetAuthor(t *testing.T) {
 	tests := []struct {
@@ -38,13 +82,9 @@ func TestGetAuthor(t *testing.T) {
 }
 
 func TestGetAuthor_NotSet(t *testing.T) {
-	old, existed := os.LookupEnv("AUTHOR")
+	// t.Setenv запоминает исходное значение и восстановит его при завершении теста.
+	t.Setenv("AUTHOR", "x")
 	os.Unsetenv("AUTHOR")
-	t.Cleanup(func() {
-		if existed {
-			os.Setenv("AUTHOR", old)
-		}
-	})
 
 	if got := getAuthor(); got != "Unspecified" {
 		t.Errorf("getAuthor() = %q, want %q", got, "Unspecified")
@@ -63,15 +103,22 @@ func TestGetHostname(t *testing.T) {
 
 func TestGetAddreses_NotNil(t *testing.T) {
 	if getAddreses() == nil {
-		t.Error("getAddreses() вернула nil, ожидался непустой срез или пустой срез")
+		t.Error("getAddreses() вернула nil, ожидался срез (возможно, пустой)")
 	}
 }
 
 func TestGetIpsV4(t *testing.T) {
 	ips := getIpsV4()
-	if ips == nil {
-		t.Fatal("getIpsV4() вернула nil, ожидался срез (возможно, пустой)")
+	if len(ips) == 0 {
+		t.Fatal("getIpsV4() вернула пустой срез, ожидался хотя бы один элемент (адрес или заглушка)")
 	}
+
+	// Если IPv4-адресов нет, функция возвращает заглушку "Unspecified".
+	if len(ips) == 1 && ips[0] == "Unspecified" {
+		t.Log("IPv4-адресов нет, получена заглушка")
+		return
+	}
+
 	for _, s := range ips {
 		ip := net.ParseIP(s)
 		if ip == nil {
@@ -90,41 +137,176 @@ func TestGetIpsV4(t *testing.T) {
 	}
 }
 
+// ---------- loadData: теперь возвращает info и не трогает кэш ----------
+
 func TestLoadData(t *testing.T) {
 	t.Setenv("AUTHOR", "Tester")
-	withData(t, info{})
 
-	loadData()
+	got := loadData()
 
-	if data.Author != "Tester" {
-		t.Errorf("Author = %q, want %q", data.Author, "Tester")
+	if got.Author != "Tester" {
+		t.Errorf("Author = %q, want %q", got.Author, "Tester")
 	}
-	if want, err := os.Hostname(); err == nil && data.Hostname != want {
-		t.Errorf("Hostname = %q, want %q", data.Hostname, want)
+	if want, err := os.Hostname(); err == nil && got.Hostname != want {
+		t.Errorf("Hostname = %q, want %q", got.Hostname, want)
 	}
-	if want := strings.Join(getIpsV4(), ", "); data.IP != want {
-		t.Errorf("IP = %q, want %q", data.IP, want)
+	if want := strings.Join(getIpsV4(), ", "); got.IP != want {
+		t.Errorf("IP = %q, want %q", got.IP, want)
 	}
 }
 
 func TestLoadData_DefaultAuthor(t *testing.T) {
 	t.Setenv("AUTHOR", "")
-	withData(t, info{})
 
-	loadData()
-
-	if data.Author != "Unspecified" {
-		t.Errorf("Author = %q, want %q", data.Author, "Unspecified")
+	if got := loadData(); got.Author != "Unspecified" {
+		t.Errorf("Author = %q, want %q", got.Author, "Unspecified")
 	}
 }
 
+func TestLoadData_DoesNotTouchCache(t *testing.T) {
+	want := info{Hostname: "cached", IP: "1.2.3.4", Author: "Cached"}
+	withFreshCache(t, want)
+	t.Setenv("AUTHOR", "Other")
+
+	loadData()
+
+	mu.Lock()
+	defer mu.Unlock()
+	if data != want {
+		t.Errorf("loadData изменила кэш: data = %+v, want %+v", data, want)
+	}
+}
+
+// ---------- getData: логика кэша с TTL ----------
+
+func TestGetData_FirstCallLoads(t *testing.T) {
+	t.Setenv("AUTHOR", "First")
+	withEmptyCache(t)
+
+	got := getData()
+
+	if got.Author != "First" {
+		t.Errorf("Author = %q, want %q", got.Author, "First")
+	}
+	if got.Hostname == "" && got.IP == "" {
+		t.Error("при первом вызове данные должны быть собраны")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if data != got {
+		t.Errorf("кэш не обновлён: data = %+v, want %+v", data, got)
+	}
+	if time.Since(lastRefresh) >= refreshTTL {
+		t.Error("lastRefresh не обновлён после сбора данных")
+	}
+}
+
+func TestGetData_UsesCacheWithinTTL(t *testing.T) {
+	cached := info{Hostname: "cached-host", IP: "10.0.0.1", Author: "Cached"}
+	withFreshCache(t, cached)
+	// Если бы данные пересобирались, Author стал бы "Changed".
+	t.Setenv("AUTHOR", "Changed")
+
+	if got := getData(); got != cached {
+		t.Errorf("getData() = %+v, want закэшированное %+v", got, cached)
+	}
+}
+
+func TestGetData_JustBeforeTTLStillCached(t *testing.T) {
+	cached := info{Hostname: "h", IP: "10.0.0.1", Author: "Cached"}
+	// Данные получены за секунду до истечения TTL.
+	setCache(t, cached, time.Now().Add(-(refreshTTL - time.Second)))
+	t.Setenv("AUTHOR", "Changed")
+
+	if got := getData(); got != cached {
+		t.Errorf("getData() = %+v, want закэшированное %+v", got, cached)
+	}
+}
+
+func TestGetData_RefreshesAfterTTL(t *testing.T) {
+	withFreshCache(t, info{Hostname: "old", IP: "10.0.0.1", Author: "Old"})
+	t.Setenv("AUTHOR", "New")
+	expireCache()
+
+	got := getData()
+
+	if got.Author != "New" {
+		t.Errorf("Author = %q, want %q (кэш должен был обновиться)", got.Author, "New")
+	}
+	if got.Hostname == "old" {
+		t.Error("Hostname остался старым, кэш не обновился")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if time.Since(lastRefresh) >= refreshTTL {
+		t.Error("lastRefresh не сдвинулся после обновления")
+	}
+}
+
+func TestGetData_TTLBoundaryRefreshes(t *testing.T) {
+	// Условие обновления нестрогое (>=): ровно refreshTTL назад уже считается устаревшим.
+	setCache(t, info{Author: "Old"}, time.Now().Add(-refreshTTL))
+	t.Setenv("AUTHOR", "New")
+
+	if got := getData(); got.Author != "New" {
+		t.Errorf("Author = %q, want %q", got.Author, "New")
+	}
+}
+
+func TestGetData_FullCycle(t *testing.T) {
+	withEmptyCache(t)
+
+	t.Setenv("AUTHOR", "A")
+	if got := getData(); got.Author != "A" {
+		t.Fatalf("1: Author = %q, want %q", got.Author, "A")
+	}
+
+	// В пределах TTL изменение окружения не видно.
+	t.Setenv("AUTHOR", "B")
+	if got := getData(); got.Author != "A" {
+		t.Fatalf("2: Author = %q, want %q (кэш)", got.Author, "A")
+	}
+
+	// После истечения TTL данные обновляются.
+	expireCache()
+	if got := getData(); got.Author != "B" {
+		t.Fatalf("3: Author = %q, want %q (обновление)", got.Author, "B")
+	}
+}
+
+// Запускать с -race: проверяет отсутствие гонок на data и lastRefresh.
+func TestGetData_Concurrent(t *testing.T) {
+	t.Setenv("AUTHOR", "Concurrent")
+	withEmptyCache(t)
+
+	const goroutines = 50
+	var wg sync.WaitGroup
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			for j := 0; j < 20; j++ {
+				if i == 0 && j%5 == 0 {
+					expireCache() // периодически форсируем обновление
+				}
+				if got := getData(); got.Author != "Concurrent" {
+					t.Errorf("Author = %q, want %q", got.Author, "Concurrent")
+					return
+				}
+			}
+		}(i)
+	}
+	wg.Wait()
+}
+
+// ---------- handler ----------
+
 func TestHandler_OK(t *testing.T) {
-	withData(t, info{Hostname: "test-host", IP: "10.0.0.1, 192.168.1.5", Author: "Tester"})
+	withFreshCache(t, info{Hostname: "test-host", IP: "10.0.0.1, 192.168.1.5", Author: "Tester"})
 
-	req := httptest.NewRequest(http.MethodGet, "/", nil)
-	rec := httptest.NewRecorder()
-	handler(rec, req)
-
+	rec := get(t, "/")
 	res := rec.Result()
 	defer res.Body.Close()
 
@@ -152,33 +334,40 @@ func TestHandler_OK(t *testing.T) {
 }
 
 func TestHandler_NotFound(t *testing.T) {
-	withData(t, info{})
+	withFreshCache(t, info{})
 
 	for _, path := range []string{"/foo", "/index.html", "/a/b", "/favicon.ico"} {
 		t.Run(path, func(t *testing.T) {
-			req := httptest.NewRequest(http.MethodGet, path, nil)
-			rec := httptest.NewRecorder()
-			handler(rec, req)
-
-			if rec.Code != http.StatusNotFound {
+			if rec := get(t, path); rec.Code != http.StatusNotFound {
 				t.Errorf("status = %d, want %d", rec.Code, http.StatusNotFound)
 			}
 		})
 	}
 }
 
+func TestHandler_NotFoundDoesNotRefresh(t *testing.T) {
+	cached := info{Hostname: "h", IP: "10.0.0.1", Author: "Cached"}
+	withFreshCache(t, cached)
+	expireCache()
+	t.Setenv("AUTHOR", "Changed")
+
+	get(t, "/nope")
+
+	mu.Lock()
+	defer mu.Unlock()
+	if data != cached {
+		t.Errorf("запрос к несуществующему пути обновил кэш: %+v", data)
+	}
+}
+
 func TestHandler_EscapesHTML(t *testing.T) {
-	withData(t, info{
+	withFreshCache(t, info{
 		Hostname: "<b>host</b>",
 		IP:       "1.1.1.1",
 		Author:   `<script>alert("xss")</script>`,
 	})
 
-	req := httptest.NewRequest(http.MethodGet, "/", nil)
-	rec := httptest.NewRecorder()
-	handler(rec, req)
-
-	body := rec.Body.String()
+	body := get(t, "/").Body.String()
 	if strings.Contains(body, "<script>") {
 		t.Error("тело содержит неэкранированный <script>")
 	}
@@ -191,12 +380,9 @@ func TestHandler_EscapesHTML(t *testing.T) {
 }
 
 func TestHandler_EmptyData(t *testing.T) {
-	withData(t, info{})
+	withFreshCache(t, info{})
 
-	req := httptest.NewRequest(http.MethodGet, "/", nil)
-	rec := httptest.NewRecorder()
-	handler(rec, req)
-
+	rec := get(t, "/")
 	if rec.Code != http.StatusOK {
 		t.Errorf("status = %d, want %d", rec.Code, http.StatusOK)
 	}
@@ -205,8 +391,62 @@ func TestHandler_EmptyData(t *testing.T) {
 	}
 }
 
+func TestHandler_LoadsDataOnFirstRequest(t *testing.T) {
+	t.Setenv("AUTHOR", "FromEnv")
+	withEmptyCache(t)
+
+	body := get(t, "/").Body.String()
+	if !strings.Contains(body, "FromEnv") {
+		t.Errorf("первый запрос должен собрать данные, в теле нет автора:\n%s", body)
+	}
+}
+
+func TestHandler_RefreshesPerTTL(t *testing.T) {
+	withEmptyCache(t)
+
+	t.Setenv("AUTHOR", "First")
+	if body := get(t, "/").Body.String(); !strings.Contains(body, "First") {
+		t.Fatalf("1: ожидался автор First:\n%s", body)
+	}
+
+	// Повторный запрос в пределах TTL отдаёт старые данные.
+	t.Setenv("AUTHOR", "Second")
+	body := get(t, "/").Body.String()
+	if !strings.Contains(body, "First") || strings.Contains(body, "Second") {
+		t.Fatalf("2: ожидались закэшированные данные (First):\n%s", body)
+	}
+
+	// После истечения TTL запрос обновляет данные.
+	expireCache()
+	body = get(t, "/").Body.String()
+	if !strings.Contains(body, "Second") || strings.Contains(body, "First") {
+		t.Fatalf("3: ожидались обновлённые данные (Second):\n%s", body)
+	}
+}
+
+func TestHandler_Concurrent(t *testing.T) {
+	t.Setenv("AUTHOR", "Parallel")
+	withEmptyCache(t)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 30; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			rec := get(t, "/")
+			if rec.Code != http.StatusOK {
+				t.Errorf("status = %d, want %d", rec.Code, http.StatusOK)
+			}
+			if !strings.Contains(rec.Body.String(), "Parallel") {
+				t.Error("в теле нет автора Parallel")
+			}
+		}()
+	}
+	wg.Wait()
+}
+
 func TestHandler_WithMux(t *testing.T) {
-	withData(t, info{Hostname: "mux-host", IP: "127.0.0.2", Author: "Mux"})
+	withFreshCache(t, info{Hostname: "mux-host", IP: "127.0.0.2", Author: "Mux"})
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", handler)
