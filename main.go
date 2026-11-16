@@ -7,9 +7,20 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
+	"time"
 )
 
-const listenAddr = ":8000"
+const (
+	listenAddr = ":8000"
+	refreshTTL = 5 * time.Second
+)
+
+var (
+	mu          sync.Mutex
+	data        info
+	lastRefresh time.Time
+)
 
 var page = template.Must(template.New("page").Parse(`
 <!DOCTYPE html>
@@ -35,13 +46,11 @@ type info struct {
 	Author   string
 }
 
-var data info
-
 func getHostname() string {
 	hostname, err := os.Hostname()
 	if err != nil {
 		log.Printf("[ERROR] Host name identify error: %v", err)
-		return ""
+		return "Unspecified"
 	}
 	return hostname
 }
@@ -67,7 +76,7 @@ func getIpsV4() []string {
 	}
 	if ips == nil {
 		log.Println("[WARNING] There are no IPv4 addresses")
-		return []string{}
+		return []string{"Unspecified"}
 	}
 	return ips
 }
@@ -81,11 +90,23 @@ func getAuthor() string {
 	return author
 }
 
-func loadData() {
-	hostname := getHostname()
-	ips := strings.Join(getIpsV4(), ", ")
-	author := getAuthor()
-	data = info{Hostname: hostname, IP: ips, Author: author}
+func getData() info {
+	mu.Lock()
+	defer mu.Unlock()
+
+	if time.Since(lastRefresh) >= refreshTTL {
+		data = loadData()
+		lastRefresh = time.Now()
+	}
+	return data
+}
+
+func loadData() info {
+	return info{
+		Hostname: getHostname(),
+		IP:       strings.Join(getIpsV4(), ", "),
+		Author:   getAuthor(),
+	}
 }
 
 func handler(w http.ResponseWriter, r *http.Request) {
@@ -95,13 +116,12 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if err := page.Execute(w, data); err != nil {
+	if err := page.Execute(w, getData()); err != nil {
 		log.Printf("[ERROR] Render error: %v", err)
 	}
 }
 
 func main() {
-	loadData()
 	http.HandleFunc("/", handler)
 	log.Fatal(http.ListenAndServe(listenAddr, nil))
 }
